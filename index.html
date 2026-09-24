@@ -146,8 +146,15 @@ function baseSpendBudget(m){
 }
 function monthSpent(m){return (m.expenses||[]).reduce((a,e)=>a+Number(e.amount||0),0)}
 function savingsUsedForMonth(m){
-  const limit=baseSpendBudget(m);
-  return Math.max(0,monthSpent(m)-limit);
+  // Oszczędności są ruszane dopiero po rozliczeniu wszystkich tygodni:
+  // najpierw nadwyżki z DOWOLNYCH dodatnich tygodni pokrywają wszystkie
+  // tygodniowe przekroczenia. Dopiero brakująca różnica schodzi z puli oszczędności.
+  let surplus=0, deficit=0;
+  (m.periods||[]).forEach(p=>{
+    const raw=Number(p.budget||0)-spentForPeriod(m,p.week);
+    if(raw>=0) surplus+=raw; else deficit+=-raw;
+  });
+  return Math.max(0,deficit-surplus);
 }
 async function syncSavingsForMonth(m){
   // Pula jest prawdziwym saldem rezerwowym. Każda zmiana wydatków
@@ -266,21 +273,43 @@ function makePeriods(year,month,total,startDay=10){
 }
 function spentForPeriod(m,w){return m.expenses.filter(e=>e.week===w).reduce((a,e)=>a+e.amount,0)}
 function weekStatuses(m){
-  const out={}; let carryOver=0;
-  (m.periods||[]).forEach(p=>{
+  const out={};
+  const periods=m.periods||[];
+  const buckets=[];
+  const deficits=[];
+
+  // Najpierw liczmy rzeczywiste saldo każdego tygodnia.
+  periods.forEach(p=>{
     const nominal=Number(p.budget||0);
     const spent=spentForPeriod(m,p.week);
-    const effective=Math.max(0,nominal-carryOver);
-    const over=Math.max(0,spent-effective);
-    const left=Math.max(0,effective-spent);
-    out[p.week]={nominal,effective,spent,over,left};
-    carryOver=over;
+    const raw=nominal-spent;
+    out[p.week]={nominal,effective:nominal,spent,over:Math.max(0,-raw),left:Math.max(0,raw),transferredIn:0,transferredOut:0};
+    if(raw>0) buckets.push({week:p.week,amount:raw});
+    if(raw<0) deficits.push({week:p.week,amount:-raw});
   });
+
+  // Każde przekroczenie może pobrać pieniądze z KAŻDEGO dodatniego
+  // tygodnia — również wcześniejszego. Nie ograniczamy się do tygodni przyszłych.
+  for(const d of deficits){
+    let need=d.amount;
+    for(const b of buckets){
+      if(need<=0) break;
+      if(b.amount<=0 || b.week===d.week) continue;
+      const take=Math.min(b.amount,need);
+      b.amount-=take;
+      need-=take;
+      out[b.week].left-=take;
+      out[b.week].transferredOut+=take;
+      out[d.week].transferredIn+=take;
+    }
+    // Jeśli zabrakło dodatnich tygodni, pozostała część trafia do oszczędności.
+    out[d.week].savingsNeeded=need;
+  }
   return out;
 }
 function dynamicBudget(m,w){
   const st=weekStatuses(m)[w];
-  return st ? st.effective : 0;
+  return st ? st.nominal : 0;
 }
 function currentPeriod(m){
  let now=new Date();
@@ -349,7 +378,7 @@ function renderSummary(){
  box.innerHTML=`<div class="small" style="margin-bottom:10px">${t('summaries')}</div><h3>${t('yearTitle')}</h3><div class="summarygrid">${yearHtml}</div><h3>${t('monthsTitle')}</h3><div class="summarygrid">${monthHtml}</div><h3>${t('weeksTitle')}</h3><div class="summarygrid">${weekHtml||`<div>${t('noWeeks')}</div>`}</div>`;
 }
 
-function render(){if(!state)return;let area=document.getElementById("monthArea");if(!state.months.length){area.innerHTML="";document.getElementById("empty").style.display="block";return}document.getElementById("empty").style.display="none";if(!currentMonth)currentMonth=state.months[0].id;let m=state.months.find(x=>x.id===currentMonth)||state.months[0];ensureMonth(m);if(!m.periods){let p=parseMonthName(m.name);m.totalBudget=baseSpendBudget(m);m.periods=makePeriods(p.year,p.month,m.totalBudget,10)}let cp=currentPeriod(m),spent=monthSpent(m),usedSavings=savingsUsedForMonth(m),cw=cp?spentForPeriod(m,cp.week):0,cb=cp?dynamicBudget(m,cp.week):0,cleft=cb-cw,tabs=state.months.map(x=>`<button class="tab ${x.id===m.id?'active':''}" onclick="selectMonth(${x.id})">${monthDisplay(x)}</button>`).join(""),weeks="";const wsAll=weekStatuses(m);m.periods.forEach(p=>{let ws=wsAll[p.week]||{effective:p.budget||0,spent:spentForPeriod(m,p.week),over:0,left:0},used=ws.spent,budget=ws.effective,left=ws.left,isCurrent=cp&&cp.week===p.week,over=ws.over,pct=budget>0?Math.min(100,used/budget*100):0;weeks+=`<div class="card week ${isCurrent?'current':''} ${over>0?'over':''}"><div class="row"><div class="weeknum">${t('week')}<br><b style="font-size:22px">${p.week}</b><br><span class="small">${p.start} – ${p.end}</span></div><div class="weekbody"><div class="row"><div><b>${t('weekBudget')}: ${money(budget)}</b><div class="stat">${t('spent')}: ${money(used)}</div></div><span class="money ${left<0?'red':'green'}">${money(left)}</span></div><div class="progress"><div class="bar ${over>0?'overbar':''}" style="width:${pct}%"></div></div>${over>0?`<div class="overbox"><span class="warningicon">⚠</span><span>${t('over')}<br><small style="font-size:12px">${t('excess')} ${money(over)}</small></span></div>`:''}</div></div>${m.expenses.filter(e=>e.week===p.week).map(e=>`<div class="expense"><div class="expense-main"><img class="expense-icon" src="${categoryIcon(e.cat)}" onerror="this.style.display='none'"><div><b>${e.desc}</b><div class="small">${catLabel(e.cat)} · ${e.date}</div></div></div><div class="row"><span class="money">${money(e.amount)}</span><button class="danger" style="padding:6px 9px" onclick="delExpense(${e.id})">×</button></div></div>`).join("")||`<div class="small" style="margin-top:10px">${t('noExpenses')}</div>`}</div>`});let remaining=Math.max(0,m.totalBudget-spent),progress=m.totalBudget>0?Math.min(100,spent/m.totalBudget*100):0;area.innerHTML=`<div class="row" style="margin-top:12px"><div class="tabs" id="monthTabs">${tabs}</div><button class="secondary" onclick="openMonth()" style="white-space:nowrap">${t('addMonth')}</button></div><div class="card"><div class="row"><div><div class="cycle">📅 ${m.startDate.split('-').reverse().join('.')} – cykl 10→10</div><div class="sub">${m.closed?t('closedCycle'):t('currentCycle')}</div></div><span class="sub">${monthDisplay(m)}</span></div><div class="statgrid"><div class="statcard"><div class="statlabel">${t('doSpend')}</div><div class="statvalue cyan">${money(Math.max(0,cleft))}</div><div class="sub">${t('thisWeek')}</div></div><div class="statcard"><div class="statlabel">${t('pool')}</div><div class="statvalue pink">${money(state.pool)}</div><div class="sub">${t('growing')}</div></div><div class="statcard"><div class="statlabel">${t('spentTotal')}</div><div class="statvalue gold">${money(spent)}</div><div class="sub">z ${money(m.totalBudget)}</div></div><div class="statcard"><div class="statlabel">${t('progress')}</div><div class="statvalue cyan">${Math.round(progress)}%</div><div class="sub">cyklu</div></div></div><div class="actionsbar"><button onclick="openExpense()">${t('addExpense')}</button><button class="secondary" onclick="openIncome()">${t('incomeGoal')}</button><button class="secondary" onclick="openFixed()">${t('fixedFees')}</button><button class="secondary wide" onclick="${m.closed?'alert(\'Miesiąc jest już zamknięty.\')':'closeMonth()'}">${m.closed?t('monthClosed'):t('closeMonth')}</button></div><div class="notice"><b>${t('pay')}:</b> ${money(m.salary)} · <b>${t('savings')}:</b> ${money(m.saving)} · <b>${t('fixed')}:</b> ${money(m.fixed)}<br><b>${t('budgetLife')}:</b> ${money(m.totalBudget)} · <b>${t('left')}:</b> ${money(remaining)}${usedSavings>0?`<br><span class="red"><b>${t('withdrawn')}:</b> ${money(usedSavings)}</span>`:''}</div><div class="chartwrap"><div class="sectiontitle">${t('chart')}</div><canvas id="chart"></canvas></div><div class="grid" style="margin-top:10px"><button class="secondary" onclick="openEditMonth()">${t('editPay')}</button><button class="secondary" onclick="resetSavings()">${t('resetPool')}</button></div></div>${weeks}`;setTimeout(()=>chart(m),0);if(document.getElementById("summaryPanel")?.open)renderSummary()}function scrollTopApp(){window.scrollTo({top:0,behavior:'smooth'})}function scrollToTabs(){document.getElementById('monthTabs')?.scrollIntoView({behavior:'smooth',block:'center'})}
+function render(){if(!state)return;let area=document.getElementById("monthArea");if(!state.months.length){area.innerHTML="";document.getElementById("empty").style.display="block";return}document.getElementById("empty").style.display="none";if(!currentMonth)currentMonth=state.months[0].id;let m=state.months.find(x=>x.id===currentMonth)||state.months[0];ensureMonth(m);if(!m.periods){let p=parseMonthName(m.name);m.totalBudget=baseSpendBudget(m);m.periods=makePeriods(p.year,p.month,m.totalBudget,10)}let cp=currentPeriod(m),spent=monthSpent(m),usedSavings=savingsUsedForMonth(m),cw=cp?spentForPeriod(m,cp.week):0,cb=cp?dynamicBudget(m,cp.week):0,cleft=cp?(weekStatuses(m)[cp.week]?.left||0):0,tabs=state.months.map(x=>`<button class="tab ${x.id===m.id?'active':''}" onclick="selectMonth(${x.id})">${monthDisplay(x)}</button>`).join(""),weeks="";const wsAll=weekStatuses(m);m.periods.forEach(p=>{let ws=wsAll[p.week]||{effective:p.budget||0,spent:spentForPeriod(m,p.week),over:0,left:0},used=ws.spent,budget=ws.effective,left=ws.left,isCurrent=cp&&cp.week===p.week,over=ws.over,pct=budget>0?Math.min(100,used/budget*100):0;weeks+=`<div class="card week ${isCurrent?'current':''} ${over>0?'over':''}"><div class="row"><div class="weeknum">${t('week')}<br><b style="font-size:22px">${p.week}</b><br><span class="small">${p.start} – ${p.end}</span></div><div class="weekbody"><div class="row"><div><b>${t('weekBudget')}: ${money(budget)}</b><div class="stat">${t('spent')}: ${money(used)}</div></div><span class="money ${left<0?'red':'green'}">${money(left)}</span></div><div class="progress"><div class="bar ${over>0?'overbar':''}" style="width:${pct}%"></div></div>${over>0?`<div class="overbox"><span class="warningicon">⚠</span><span>${t('over')}<br><small style="font-size:12px">${t('excess')} ${money(over)}</small></span></div>`:''}</div></div>${m.expenses.filter(e=>e.week===p.week).map(e=>`<div class="expense"><div class="expense-main"><img class="expense-icon" src="${categoryIcon(e.cat)}" onerror="this.style.display='none'"><div><b>${e.desc}</b><div class="small">${catLabel(e.cat)} · ${e.date}</div></div></div><div class="row"><span class="money">${money(e.amount)}</span><button class="danger" style="padding:6px 9px" onclick="delExpense(${e.id})">×</button></div></div>`).join("")||`<div class="small" style="margin-top:10px">${t('noExpenses')}</div>`}</div>`});let remaining=Math.max(0,m.totalBudget-spent),progress=m.totalBudget>0?Math.min(100,spent/m.totalBudget*100):0;area.innerHTML=`<div class="row" style="margin-top:12px"><div class="tabs" id="monthTabs">${tabs}</div><button class="secondary" onclick="openMonth()" style="white-space:nowrap">${t('addMonth')}</button></div><div class="card"><div class="row"><div><div class="cycle">📅 ${m.startDate.split('-').reverse().join('.')} – cykl 10→10</div><div class="sub">${m.closed?t('closedCycle'):t('currentCycle')}</div></div><span class="sub">${monthDisplay(m)}</span></div><div class="statgrid"><div class="statcard"><div class="statlabel">${t('doSpend')}</div><div class="statvalue cyan">${money(Math.max(0,cleft))}</div><div class="sub">${t('thisWeek')}</div></div><div class="statcard"><div class="statlabel">${t('pool')}</div><div class="statvalue pink">${money(state.pool)}</div><div class="sub">${t('growing')}</div></div><div class="statcard"><div class="statlabel">${t('spentTotal')}</div><div class="statvalue gold">${money(spent)}</div><div class="sub">z ${money(m.totalBudget)}</div></div><div class="statcard"><div class="statlabel">${t('progress')}</div><div class="statvalue cyan">${Math.round(progress)}%</div><div class="sub">cyklu</div></div></div><div class="actionsbar"><button onclick="openExpense()">${t('addExpense')}</button><button class="secondary" onclick="openIncome()">${t('incomeGoal')}</button><button class="secondary" onclick="openFixed()">${t('fixedFees')}</button><button class="secondary wide" onclick="${m.closed?'alert(\'Miesiąc jest już zamknięty.\')':'closeMonth()'}">${m.closed?t('monthClosed'):t('closeMonth')}</button></div><div class="notice"><b>${t('pay')}:</b> ${money(m.salary)} · <b>${t('savings')}:</b> ${money(m.saving)} · <b>${t('fixed')}:</b> ${money(m.fixed)}<br><b>${t('budgetLife')}:</b> ${money(m.totalBudget)} · <b>${t('left')}:</b> ${money(remaining)}${usedSavings>0?`<br><span class="red"><b>${t('withdrawn')}:</b> ${money(usedSavings)}</span>`:''}</div><div class="chartwrap"><div class="sectiontitle">${t('chart')}</div><canvas id="chart"></canvas></div><div class="grid" style="margin-top:10px"><button class="secondary" onclick="openEditMonth()">${t('editPay')}</button><button class="secondary" onclick="resetSavings()">${t('resetPool')}</button></div></div>${weeks}`;setTimeout(()=>chart(m),0);if(document.getElementById("summaryPanel")?.open)renderSummary()}function scrollTopApp(){window.scrollTo({top:0,behavior:'smooth'})}function scrollToTabs(){document.getElementById('monthTabs')?.scrollIntoView({behavior:'smooth',block:'center'})}
 </script>
 <script>setupLanguageSelect();</script>
 <script>if("serviceWorker"in navigator)navigator.serviceWorker.register("sw.js");</script>

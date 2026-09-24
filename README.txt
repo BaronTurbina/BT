@@ -18,3 +18,6 @@ index.html musi leżeć w katalogu głównym repozytorium, a folder icons obok n
 - PIN + AES-GCM 256 / PBKDF2
 - języki z V14
 - Synthwave / Miami Sunset
+
+
+V14.1: OVER LIMIT rozlicza przekroczenia globalnie — może pobrać niewykorzystane środki z każdego dodatniego tygodnia (także wcześniejszego). Jeśli suma dodatnich sald nie wystarczy, brakująca część jest pobierana z puli oszczędności.
